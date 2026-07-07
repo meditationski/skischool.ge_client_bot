@@ -29,6 +29,7 @@ const { calculatePrice, getTimeSlots } = require('./pricing');
 const { getAvailableTimeSlots, clearAvailabilityCache } = require('./availability');
 const { buildCalendarModel, isWithinBookingPeriod, BOOKING_PERIOD } = require('./calendar');
 const { createInvoice, verifyIpnSignature } = require('./nowpayments');
+const cryptobot = require('./cryptobot');
 const { I18N } = require('./i18n');
 
 function requireEnv(name) {
@@ -520,6 +521,8 @@ bot.action('confirm_booking', async (ctx) => {
 
   await ctx.reply(t(session, 'creating_invoice'));
 
+  const buttons = [];
+
   try {
     const invoice = await createInvoice({
       bookingId,
@@ -529,21 +532,32 @@ bot.action('confirm_booking', async (ctx) => {
       successUrl: `https://t.me/${ctx.botInfo.username}`,
       cancelUrl: `https://t.me/${ctx.botInfo.username}`
     });
-
-    pendingBookings.set(bookingId, { chatId: ctx.chat.id, order, createdAt: Date.now() });
-
-    await ctx.reply(
-      t(session, 'invoice_ready', session.prices.depositPrice),
-      Markup.inlineKeyboard([
-        [Markup.button.url(t(session, 'btn_pay'), invoice.invoice_url)],
-        [Markup.button.callback(t(session, 'btn_check_status'), `check_${bookingId}`)]
-      ])
-    );
+    buttons.push([Markup.button.url(t(session, 'btn_pay'), invoice.invoice_url)]);
   } catch (error) {
-    console.error('❌ Invoice creation failed:', error);
+    console.error('❌ NOWPayments invoice creation failed:', error);
+  }
+
+  try {
+    const cbInvoice = await cryptobot.createInvoice({
+      bookingId,
+      amount: session.prices.depositPrice,
+      description: `SkiSchool.ge booking ${bookingId}`
+    });
+    buttons.push([Markup.button.url(t(session, 'btn_pay_cryptobot'), cbInvoice.bot_invoice_url)]);
+  } catch (error) {
+    console.error('❌ CryptoBot invoice creation failed:', error);
+  }
+
+  if (buttons.length === 0) {
     await ctx.reply(t(session, 'invoice_error'));
     session.step = 'confirm';
+    return;
   }
+
+  pendingBookings.set(bookingId, { chatId: ctx.chat.id, order, createdAt: Date.now() });
+
+  buttons.push([Markup.button.callback(t(session, 'btn_check_status'), `check_${bookingId}`)]);
+  await ctx.reply(t(session, 'invoice_ready', session.prices.depositPrice), Markup.inlineKeyboard(buttons));
 });
 
 bot.action(/check_(.+)/, async (ctx) => {
@@ -560,36 +574,12 @@ bot.action(/check_(.+)/, async (ctx) => {
 });
 
 // ============ NOWPAYMENTS IPN ============
-app.post('/ipn/nowpayments', async (req, res) => {
-  const signature = req.get('x-nowpayments-sig');
-  const { verified, skipped } = verifyIpnSignature(req.rawBody, signature);
-
-  if (!skipped && !verified) {
-    console.warn('⚠️ Rejected IPN with invalid signature');
-    return res.status(401).json({ error: 'Invalid signature' });
-  }
-  if (skipped) {
-    console.warn('⚠️ Processing IPN WITHOUT signature verification (NOWPAYMENTS_IPN_SECRET not set) — INSECURE.');
-  }
-
-  const payload = req.body;
-  const bookingId = payload.order_id;
+async function finalizeConfirmedPayment(bookingId, paymentId, paymentProvider) {
   const pending = pendingBookings.get(bookingId);
+  if (!pending) return; // already finalized, or unknown booking — nothing to do
 
-  console.log(`📩 IPN for ${bookingId}: status=${payload.payment_status}`);
-
-  if (!pending) {
-    console.warn(`⚠️ IPN for unknown/already-finalized booking ${bookingId}`);
-    return res.json({ ok: true });
-  }
-
-  const isFinal = payload.payment_status === 'finished' || payload.payment_status === 'confirmed';
-  if (!isFinal) {
-    // Still waiting/confirming — nothing to do yet, NOWPayments will call again.
-    return res.json({ ok: true });
-  }
-
-  pending.order.paymentId = String(payload.payment_id);
+  pending.order.paymentId = String(paymentId);
+  pending.order.paymentProvider = paymentProvider;
 
   try {
     const resp = await fetch(ADMIN_BOT_WEBHOOK_URL, {
@@ -601,12 +591,10 @@ app.post('/ipn/nowpayments', async (req, res) => {
       body: JSON.stringify(pending.order)
     });
 
-    const session = sessions.get(
-      // We only have chatId, not the Telegram user id the session Map is
-      // keyed by — but chat.id === from.id for private chats, which is all
-      // this bot supports, so this lookup is safe here.
-      pending.chatId
-    );
+    // We only have chatId, not the Telegram user id the session Map is
+    // keyed by — but chat.id === from.id for private chats, which is all
+    // this bot supports, so this lookup is safe here.
+    const session = sessions.get(pending.chatId);
 
     if (resp.ok) {
       const text = (session ? t(session, 'payment_confirmed') : I18N.ru.payment_confirmed) +
@@ -622,7 +610,64 @@ app.post('/ipn/nowpayments', async (req, res) => {
   } catch (error) {
     console.error('❌ Error forwarding confirmed crypto booking to admin bot:', error);
   }
+}
 
+app.post('/ipn/nowpayments', async (req, res) => {
+  const signature = req.get('x-nowpayments-sig');
+  const { verified, skipped } = verifyIpnSignature(req.rawBody, signature);
+
+  if (!skipped && !verified) {
+    console.warn('⚠️ Rejected IPN with invalid signature');
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+  if (skipped) {
+    console.warn('⚠️ Processing IPN WITHOUT signature verification (NOWPAYMENTS_IPN_SECRET not set) — INSECURE.');
+  }
+
+  const payload = req.body;
+  const bookingId = payload.order_id;
+
+  console.log(`📩 NOWPayments IPN for ${bookingId}: status=${payload.payment_status}`);
+
+  const isFinal = payload.payment_status === 'finished' || payload.payment_status === 'confirmed';
+  if (!isFinal) {
+    // Still waiting/confirming — nothing to do yet, NOWPayments will call again.
+    return res.json({ ok: true });
+  }
+
+  await finalizeConfirmedPayment(bookingId, payload.payment_id, 'nowpayments');
+  res.json({ ok: true });
+});
+
+// CryptoBot's Crypto Pay API webhook — same finalize path as NOWPayments,
+// just a different provider and a different signature scheme (see cryptobot.js).
+app.post('/webhook/cryptobot', async (req, res) => {
+  const signature = req.get('crypto-pay-api-signature');
+  const { verified, skipped } = cryptobot.verifyWebhookSignature(req.body, signature);
+
+  if (!skipped && !verified) {
+    console.warn('⚠️ Rejected CryptoBot webhook with invalid signature');
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+  if (skipped) {
+    console.warn('⚠️ Processing CryptoBot webhook WITHOUT signature verification (CRYPTOBOT_API_TOKEN not set) — INSECURE.');
+  }
+
+  const update = req.body;
+  if (update.update_type !== 'invoice_paid') {
+    return res.json({ ok: true });
+  }
+
+  const invoice = update.payload || {};
+  const bookingId = invoice.payload; // our bookingId, round-tripped via the invoice's custom `payload` field
+
+  console.log(`📩 CryptoBot webhook for ${bookingId}: status=${invoice.status}`);
+
+  if (invoice.status !== 'paid') {
+    return res.json({ ok: true });
+  }
+
+  await finalizeConfirmedPayment(bookingId, `cryptobot_${invoice.invoice_id}`, 'cryptobot');
   res.json({ ok: true });
 });
 

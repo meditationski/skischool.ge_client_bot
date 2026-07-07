@@ -9,8 +9,8 @@
  */
 
 const BOOKING_PERIOD = {
-  startDate: new Date('2025-12-27T00:00:00Z'),
-  endDate: new Date('2026-02-28T00:00:00Z')
+  startDate: new Date('2026-07-07T00:00:00Z'),
+  endDate: new Date('2026-07-10T00:00:00Z')
 };
 
 const MONTH_NAMES = {

@@ -1,7 +1,7 @@
 {
   "name": "skischool-ge-client-bot",
   "version": "1.0.0",
-  "description": "Client-facing Telegram bot — mirrors the web booking form, pays via USDT (NOWPayments)",
+  "description": "Client-facing Telegram bot — mirrors the web booking form, pays via USDT through @CryptoBot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

@@ -1,34 +1,43 @@
 /**
  * index.js — client-facing Telegram bot. Mirrors the web booking form's
  * steps (sport → duration → participants → days → calendar/time → personal
- * info → payment), but pays via USDT (NOWPayments) instead of PayPal.
+ * info → payment), paying via USDT through @CryptoBot.
  *
  * Architecture: this bot does NOT touch the shared MySQL database directly.
  * Once a payment is confirmed, it POSTs the completed booking to the admin
  * bot's /webhook/booking-crypto endpoint — the same order-creation,
  * admin-notification, and client-email pipeline already built and tested
- * there. This bot's only jobs are: collect the booking details, and handle
- * the crypto payment.
+ * there for PayPal bookings.
+ *
+ * UX: this version auto-deletes each step's message as the conversation
+ * moves forward (a running "trail" of message IDs, cleaned right before the
+ * next step renders), so the chat stays a single evolving screen instead of
+ * a long scrollback. The one exception is the booking summary — that
+ * message is never deleted; instead it's edited in place, first with the
+ * confirm/cancel buttons, then (once the client taps confirm) with the
+ * payment button, and finally with the payment-confirmed message. This
+ * mirrors "swap the button" rather than "send another message".
  *
  * KNOWN LIMITATIONS (v1 — flagged intentionally, not oversights):
  * - In-memory session state (a Map). If this process restarts mid-booking,
  *   that booking's progress is lost and the client has to /start over. No
- *   payment is lost though — NOWPayments and the admin bot's DB are the
+ *   payment is lost though — CryptoBot and the admin bot's DB are the
  *   sources of truth for anything post-payment.
  * - No "go back and edit day 2" — if a client wants to change an earlier
- *   day's date/time, they need to /cancel and start over. The web form
- *   supports jumping between days; this v1 keeps the conversation linear
- *   for simplicity. Worth adding later if clients ask for it.
+ *   day's date/time, they need to /cancel and start over.
  * - Booking season dates live in calendar.js (BOOKING_PERIOD) — update
  *   those before each season, same as the web form's app.js.
+ * - Telegram only lets a bot delete its own messages if they're recent
+ *   enough / still editable — deleteMessage calls are wrapped in try/catch
+ *   and silently ignored on failure (the trail just won't fully clear in
+ *   that rare case, nothing breaks).
  */
 
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const { calculatePrice, getTimeSlots } = require('./pricing');
 const { getAvailableTimeSlots, clearAvailabilityCache } = require('./availability');
-const { buildCalendarModel, isWithinBookingPeriod, BOOKING_PERIOD } = require('./calendar');
-const { createInvoice, verifyIpnSignature } = require('./nowpayments');
+const { buildCalendarModel, isWithinBookingPeriod } = require('./calendar');
 const cryptobot = require('./cryptobot');
 const { I18N } = require('./i18n');
 
@@ -42,31 +51,24 @@ function requireEnv(name) {
 }
 
 const BOT_TOKEN = requireEnv('BOT_TOKEN');
-const ADMIN_BOT_WEBHOOK_URL = requireEnv('ADMIN_BOT_WEBHOOK_URL'); // e.g. https://skischoolgebot-production.up.railway.app/webhook/booking-crypto
+const ADMIN_BOT_WEBHOOK_URL = requireEnv('ADMIN_BOT_WEBHOOK_URL');
 const BOOKING_WEBHOOK_SECRET = process.env.BOOKING_WEBHOOK_SECRET || '';
-const PUBLIC_URL = requireEnv('PUBLIC_URL'); // this bot's own public URL, for the NOWPayments IPN callback
 
 const bot = new Telegraf(BOT_TOKEN);
 bot.catch((err, ctx) => console.error('❌ Bot error:', err));
 
 const app = express();
-// NOWPayments IPN needs the raw body to verify the signature, so capture it
-// before express.json() parses it.
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf.toString('utf8'); }
-}));
+app.use(express.json());
 
 // ============ SESSION STATE ============
 const sessions = new Map();
-// pendingBookings: bookingId -> { chatId, order }. Populated when an invoice
-// is created, consumed when the IPN confirms payment (or expires — see cron
-// cleanup at the bottom).
+// pendingBookings: bookingId -> { chatId, summaryMessageId, order, createdAt }
 const pendingBookings = new Map();
 
 function getSession(ctx) {
   const id = ctx.from.id;
   if (!sessions.has(id)) {
-    sessions.set(id, { step: 'lang' });
+    sessions.set(id, { step: 'lang', trail: [] });
   }
   return sessions.get(id);
 }
@@ -81,12 +83,40 @@ function t(session, key, ...args) {
   return typeof entry === 'function' ? entry(...args) : entry;
 }
 
+// ============ MESSAGE TRAIL (auto-cleanup) ============
+async function cleanTrail(ctx, session) {
+  if (!session.trail || session.trail.length === 0) return;
+  const ids = session.trail;
+  session.trail = [];
+  for (const id of ids) {
+    try {
+      await ctx.telegram.deleteMessage(ctx.chat.id, id);
+    } catch (e) {
+      // Message already gone, too old to delete, or similar — not worth surfacing.
+    }
+  }
+}
+
+function track(session, messageId) {
+  if (!session.trail) session.trail = [];
+  session.trail.push(messageId);
+}
+
+async function step(ctx, session, text, extra) {
+  await cleanTrail(ctx, session);
+  const msg = await ctx.reply(text, extra);
+  track(session, msg.message_id);
+  return msg;
+}
+
 // ============ /start, /cancel ============
-bot.start((ctx) => {
+bot.start(async (ctx) => {
   resetSession(ctx);
   const session = getSession(ctx);
-  ctx.reply(t(session, 'start'));
-  ctx.reply(
+  await step(ctx, session, t(session, 'start'));
+  await step(
+    ctx,
+    session,
     t(session, 'choose_lang'),
     Markup.inlineKeyboard([
       [Markup.button.callback('🇷🇺 Русский', 'lang_ru'), Markup.button.callback('🇬🇧 English', 'lang_en')]
@@ -94,24 +124,27 @@ bot.start((ctx) => {
   );
 });
 
-bot.command('cancel', (ctx) => {
-  const had = sessions.has(ctx.from.id);
+bot.command('cancel', async (ctx) => {
+  const session = sessions.get(ctx.from.id);
+  const had = !!session;
+  if (session) await cleanTrail(ctx, session);
   resetSession(ctx);
-  const lang = I18N.ru.cancelled ? 'ru' : 'ru';
-  ctx.reply(had ? I18N.ru.cancelled + ' / ' + I18N.en.cancelled : I18N.ru.nothing_to_cancel + ' / ' + I18N.en.nothing_to_cancel);
+  await ctx.reply(had ? `${I18N.ru.cancelled} / ${I18N.en.cancelled}` : `${I18N.ru.nothing_to_cancel} / ${I18N.en.nothing_to_cancel}`);
 });
 
 // ============ STEP: language ============
-bot.action(/lang_(ru|en)/, (ctx) => {
+bot.action(/lang_(ru|en)/, async (ctx) => {
   const session = getSession(ctx);
   session.lang = ctx.match[1];
   session.step = 'sport';
-  ctx.answerCbQuery();
-  askSport(ctx, session);
+  await ctx.answerCbQuery();
+  await askSport(ctx, session);
 });
 
-function askSport(ctx, session) {
-  ctx.reply(
+async function askSport(ctx, session) {
+  await step(
+    ctx,
+    session,
     t(session, 'choose_sport'),
     Markup.inlineKeyboard([
       [Markup.button.callback(t(session, 'tab_ski'), 'sport_ski')],
@@ -122,15 +155,15 @@ function askSport(ctx, session) {
 }
 
 // ============ STEP: sport ============
-bot.action(/sport_(ski|snowboard|kids)/, (ctx) => {
+bot.action(/sport_(ski|snowboard|kids)/, async (ctx) => {
   const session = getSession(ctx);
   session.sport = ctx.match[1];
   session.step = 'duration';
-  ctx.answerCbQuery();
-  askDuration(ctx, session);
+  await ctx.answerCbQuery();
+  await askDuration(ctx, session);
 });
 
-function askDuration(ctx, session) {
+async function askDuration(ctx, session) {
   const buttons = session.sport === 'kids'
     ? [
         [Markup.button.callback(t(session, 'kids_full'), 'dur_full')],
@@ -142,50 +175,51 @@ function askDuration(ctx, session) {
         [Markup.button.callback(t(session, 'duration_3'), 'dur_3')],
         [Markup.button.callback(t(session, 'duration_full'), 'dur_full')]
       ];
-  ctx.reply(t(session, 'choose_duration'), Markup.inlineKeyboard(buttons));
+  await step(ctx, session, t(session, 'choose_duration'), Markup.inlineKeyboard(buttons));
 }
 
 // ============ STEP: duration ============
-bot.action(/dur_(2|3|full|half-lunch|half-nolunch)/, (ctx) => {
+bot.action(/dur_(2|3|full|half-lunch|half-nolunch)/, async (ctx) => {
   const session = getSession(ctx);
   session.duration = ctx.match[1];
   session.step = 'participants';
-  ctx.answerCbQuery();
-  askParticipants(ctx, session);
+  await ctx.answerCbQuery();
+  await askParticipants(ctx, session);
 });
 
-function askParticipants(ctx, session) {
+async function askParticipants(ctx, session) {
   const max = session.sport === 'kids' ? 6 : 5;
-  const row1 = [];
-  for (let i = 1; i <= max; i++) row1.push(Markup.button.callback(String(i), `people_${i}`));
-  // Split into rows of up to 5 buttons for readability
+  const buttons = [];
+  for (let i = 1; i <= max; i++) buttons.push(Markup.button.callback(String(i), `people_${i}`));
   const rows = [];
-  for (let i = 0; i < row1.length; i += 5) rows.push(row1.slice(i, i + 5));
-  ctx.reply(
+  for (let i = 0; i < buttons.length; i += 5) rows.push(buttons.slice(i, i + 5));
+  await step(
+    ctx,
+    session,
     session.sport === 'kids' ? t(session, 'choose_kids') : t(session, 'choose_participants'),
     Markup.inlineKeyboard(rows)
   );
 }
 
 // ============ STEP: participants ============
-bot.action(/people_(\d+)/, (ctx) => {
+bot.action(/people_(\d+)/, async (ctx) => {
   const session = getSession(ctx);
   session.participants = parseInt(ctx.match[1], 10);
   session.step = 'days';
-  ctx.answerCbQuery();
-  askDays(ctx, session);
+  await ctx.answerCbQuery();
+  await askDays(ctx, session);
 });
 
-function askDays(ctx, session) {
+async function askDays(ctx, session) {
   const buttons = [];
   for (let i = 1; i <= 8; i++) buttons.push(Markup.button.callback(String(i), `days_${i}`));
   const rows = [];
   for (let i = 0; i < buttons.length; i += 4) rows.push(buttons.slice(i, i + 4));
-  ctx.reply(t(session, 'choose_days'), Markup.inlineKeyboard(rows));
+  await step(ctx, session, t(session, 'choose_days'), Markup.inlineKeyboard(rows));
 }
 
 // ============ STEP: days -> initialize schedule ============
-bot.action(/days_(\d+)/, (ctx) => {
+bot.action(/days_(\d+)/, async (ctx) => {
   const session = getSession(ctx);
   session.days = parseInt(ctx.match[1], 10);
   session.lessons = [];
@@ -196,12 +230,13 @@ bot.action(/days_(\d+)/, (ctx) => {
   session.calYear = now.getUTCFullYear();
   session.calMonth = now.getUTCMonth();
   session.step = 'schedule_date';
-  ctx.answerCbQuery();
-  showCalendar(ctx, session);
+  session.calendarMessageId = null;
+  await ctx.answerCbQuery();
+  await showCalendar(ctx, session);
 });
 
 // ============ CALENDAR RENDERING ============
-function showCalendar(ctx, session) {
+async function showCalendar(ctx, session) {
   const lesson = session.lessons[session.currentLessonIndex];
   const bookedDates = session.lessons.filter(l => l.date).map(l => l.date);
   const model = buildCalendarModel(session.calYear, session.calMonth, session.lang, bookedDates);
@@ -227,29 +262,36 @@ function showCalendar(ctx, session) {
   const keyboard = Markup.inlineKeyboard(rows);
 
   if (session.calendarMessageId) {
-    ctx.telegram.editMessageText(ctx.chat.id, session.calendarMessageId, undefined, label, keyboard)
-      .catch(() => ctx.reply(label, keyboard).then(msg => { session.calendarMessageId = msg.message_id; }));
-  } else {
-    ctx.reply(label, keyboard).then(msg => { session.calendarMessageId = msg.message_id; });
+    try {
+      await ctx.telegram.editMessageText(ctx.chat.id, session.calendarMessageId, undefined, label, keyboard);
+      return;
+    } catch (e) {
+      // Fall through and send a fresh one if editing failed for any reason.
+    }
   }
+
+  await cleanTrail(ctx, session);
+  const msg = await ctx.reply(label, keyboard);
+  session.calendarMessageId = msg.message_id;
+  track(session, msg.message_id);
 }
 
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
-bot.action('cal_prev', (ctx) => {
+bot.action('cal_prev', async (ctx) => {
   const session = getSession(ctx);
   session.calMonth--;
   if (session.calMonth < 0) { session.calMonth = 11; session.calYear--; }
-  ctx.answerCbQuery();
-  showCalendar(ctx, session);
+  await ctx.answerCbQuery();
+  await showCalendar(ctx, session);
 });
 
-bot.action('cal_next', (ctx) => {
+bot.action('cal_next', async (ctx) => {
   const session = getSession(ctx);
   session.calMonth++;
   if (session.calMonth > 11) { session.calMonth = 0; session.calYear++; }
-  ctx.answerCbQuery();
-  showCalendar(ctx, session);
+  await ctx.answerCbQuery();
+  await showCalendar(ctx, session);
 });
 
 bot.action(/cal_(\d{4}-\d{2}-\d{2})/, async (ctx) => {
@@ -262,7 +304,7 @@ bot.action(/cal_(\d{4}-\d{2}-\d{2})/, async (ctx) => {
 
   session.lessons[session.currentLessonIndex].date = dateStr;
   session.step = 'schedule_time';
-  ctx.answerCbQuery();
+  await ctx.answerCbQuery();
   await showTimeSlots(ctx, session);
 });
 
@@ -272,9 +314,6 @@ async function showTimeSlots(ctx, session) {
   const allSlots = getTimeSlots(session.sport, session.duration);
   const available = await getAvailableTimeSlots(lesson.date, session.sport, session.duration);
 
-  // Prevent overlapping bookings across the days already chosen in this
-  // session, same rule as the web form: same date + overlapping duration
-  // window means that slot isn't offered.
   const durationHours = { '2': 2, '3': 3, 'full': 7 }[session.duration] || 1;
   const conflictsWith = session.lessons.filter((l, i) => i !== session.currentLessonIndex && l.date === lesson.date && l.time);
 
@@ -290,8 +329,9 @@ async function showTimeSlots(ctx, session) {
   });
 
   if (openSlots.length === 0) {
-    await ctx.reply(t(session, 'no_slots_this_date'));
+    await step(ctx, session, t(session, 'no_slots_this_date'));
     session.step = 'schedule_date';
+    session.calendarMessageId = null;
     return showCalendar(ctx, session);
   }
 
@@ -300,61 +340,68 @@ async function showTimeSlots(ctx, session) {
   for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
 
   const label = t(session, 'choose_time', lesson.number, session.days);
-  await ctx.reply(label, Markup.inlineKeyboard(rows));
+  const msg = await ctx.reply(label, Markup.inlineKeyboard(rows));
+  track(session, msg.message_id);
 }
 
-bot.action(/time_(\d{2}:\d{2})/, (ctx) => {
+bot.action(/time_(\d{2}:\d{2})/, async (ctx) => {
   const session = getSession(ctx);
   session.lessons[session.currentLessonIndex].time = ctx.match[1];
-  ctx.answerCbQuery();
+  await ctx.answerCbQuery();
 
   const nextIndex = session.currentLessonIndex + 1;
   if (nextIndex < session.days) {
     session.currentLessonIndex = nextIndex;
     session.calendarMessageId = null;
     session.step = 'schedule_date';
-    showCalendar(ctx, session);
+    await showCalendar(ctx, session);
   } else {
     session.step = 'ask_name';
-    ctx.reply(t(session, 'ask_name'));
+    await step(ctx, session, t(session, 'ask_name'));
   }
 });
 
 // ============ TEXT-BASED STEPS (personal info) ============
 bot.on('text', async (ctx) => {
   const session = getSession(ctx);
+
+  const stepsExpectingText = ['ask_name', 'ask_phone', 'ask_email', 'ask_age', 'ask_special'];
+  if (stepsExpectingText.includes(session.step)) {
+    track(session, ctx.message.message_id);
+  }
+
   const text = ctx.message.text.trim();
 
   switch (session.step) {
     case 'ask_name': {
-      if (text.length < 2) return; // ignore empty/garbage, keep prompting implicitly
+      if (text.length < 2) return;
       session.fullName = text;
       session.step = 'ask_phone';
-      return ctx.reply(t(session, 'ask_phone'));
+      return step(ctx, session, t(session, 'ask_phone'));
     }
     case 'ask_phone': {
       const cleaned = text.replace(/[\s()-]/g, '');
       if (!/^\+?\d{7,15}$/.test(cleaned)) {
-        return ctx.reply(t(session, 'invalid_phone'));
+        return step(ctx, session, t(session, 'invalid_phone'));
       }
       session.phone = cleaned;
       session.step = 'ask_email';
-      return ctx.reply(t(session, 'ask_email'));
+      return step(ctx, session, t(session, 'ask_email'));
     }
     case 'ask_email': {
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
-        return ctx.reply(t(session, 'invalid_email'));
+        return step(ctx, session, t(session, 'invalid_email'));
       }
       session.email = text;
       session.step = 'ask_age';
-      return ctx.reply(t(session, 'ask_age'));
+      return step(ctx, session, t(session, 'ask_age'));
     }
     case 'ask_age': {
       const age = parseInt(text, 10);
       const isKids = session.sport === 'kids';
       const min = 5, max = isKids ? 13 : 80;
       if (isNaN(age) || age < min || age > max) {
-        return ctx.reply(isKids ? t(session, 'invalid_age_kids') : t(session, 'invalid_age_adult'));
+        return step(ctx, session, isKids ? t(session, 'invalid_age_kids') : t(session, 'invalid_age_adult'));
       }
       session.age = age;
       session.step = 'ask_skill';
@@ -366,14 +413,13 @@ bot.on('text', async (ctx) => {
       return showSummary(ctx, session);
     }
     default:
-      // Not currently expecting free text (e.g. mid-calendar) — nudge toward buttons.
       if (['schedule_date', 'schedule_time', 'sport', 'duration', 'participants', 'days', 'ask_skill', 'ask_pref_lang', 'confirm', 'paying'].includes(session.step)) {
         return ctx.reply(t(session, 'unexpected_input'));
       }
   }
 });
 
-function askSkill(ctx, session) {
+async function askSkill(ctx, session) {
   const isKids = session.sport === 'kids';
   const buttons = isKids
     ? [
@@ -386,18 +432,18 @@ function askSkill(ctx, session) {
         [Markup.button.callback(t(session, 'skill_intermediate'), 'skill_intermediate')],
         [Markup.button.callback(t(session, 'skill_advanced'), 'skill_advanced')]
       ];
-  ctx.reply(t(session, 'choose_skill'), Markup.inlineKeyboard(buttons));
+  await step(ctx, session, t(session, 'choose_skill'), Markup.inlineKeyboard(buttons));
 }
 
-bot.action(/skill_(first-time|beginner|intermediate|advanced)/, (ctx) => {
+bot.action(/skill_(first-time|beginner|intermediate|advanced)/, async (ctx) => {
   const session = getSession(ctx);
   session.skillLevel = ctx.match[1];
   session.step = 'ask_pref_lang';
-  ctx.answerCbQuery();
-  askPrefLang(ctx, session);
+  await ctx.answerCbQuery();
+  await askPrefLang(ctx, session);
 });
 
-function askPrefLang(ctx, session) {
+async function askPrefLang(ctx, session) {
   const isKids = session.sport === 'kids';
   const buttons = isKids
     ? [
@@ -410,23 +456,23 @@ function askPrefLang(ctx, session) {
         [Markup.button.callback(t(session, 'pref_lang_georgian'), 'pl_georgian')],
         [Markup.button.callback(t(session, 'pref_lang_other'), 'pl_other')]
       ];
-  ctx.reply(t(session, 'choose_pref_lang'), Markup.inlineKeyboard(buttons));
+  await step(ctx, session, t(session, 'choose_pref_lang'), Markup.inlineKeyboard(buttons));
 }
 
-bot.action(/pl_(english|russian|georgian|other)/, (ctx) => {
+bot.action(/pl_(english|russian|georgian|other)/, async (ctx) => {
   const session = getSession(ctx);
   session.preferredLanguage = ctx.match[1];
   session.step = 'ask_special';
-  ctx.answerCbQuery();
-  ctx.reply(t(session, 'ask_special'), Markup.inlineKeyboard([[Markup.button.callback(t(session, 'skip'), 'skip_special')]]));
+  await ctx.answerCbQuery();
+  await step(ctx, session, t(session, 'ask_special'), Markup.inlineKeyboard([[Markup.button.callback(t(session, 'skip'), 'skip_special')]]));
 });
 
-bot.action('skip_special', (ctx) => {
+bot.action('skip_special', async (ctx) => {
   const session = getSession(ctx);
   session.specialRequests = '';
   session.step = 'confirm';
-  ctx.answerCbQuery();
-  showSummary(ctx, session);
+  await ctx.answerCbQuery();
+  await showSummary(ctx, session);
 });
 
 // ============ SUMMARY + PRICE ============
@@ -442,7 +488,7 @@ function durationLabel(session) {
   return t(session, map[session.duration]);
 }
 
-function showSummary(ctx, session) {
+function summaryText(session) {
   const prices = calculatePrice(session);
   session.prices = prices;
 
@@ -470,19 +516,36 @@ function showSummary(ctx, session) {
     `${t(session, 'remaining')}: $${prices.remainingPrice}`
   ].filter(Boolean);
 
-  ctx.reply(
-    lines.join('\n'),
-    Markup.inlineKeyboard([
-      [Markup.button.callback(t(session, 'btn_confirm'), 'confirm_booking')],
-      [Markup.button.callback(t(session, 'btn_cancel'), 'cancel_booking')]
-    ])
-  );
+  return lines.join('\n');
 }
 
-bot.action('cancel_booking', (ctx) => {
+async function showSummary(ctx, session) {
+  await cleanTrail(ctx, session);
+  const text = summaryText(session);
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback(t(session, 'btn_confirm'), 'confirm_booking')],
+    [Markup.button.callback(t(session, 'btn_cancel'), 'cancel_booking')]
+  ]);
+  const msg = await ctx.reply(text, keyboard);
+  session.summaryMessageId = msg.message_id;
+}
+
+bot.action('cancel_booking', async (ctx) => {
+  const session = getSession(ctx);
+  await ctx.answerCbQuery();
+  if (session.summaryMessageId) {
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        session.summaryMessageId,
+        undefined,
+        `${summaryText(session)}\n\n${I18N.ru.cancelled} / ${I18N.en.cancelled}`
+      );
+    } catch (e) {
+      await ctx.reply(`${I18N.ru.cancelled} / ${I18N.en.cancelled}`);
+    }
+  }
   resetSession(ctx);
-  ctx.answerCbQuery();
-  ctx.reply(I18N.ru.cancelled + ' / ' + I18N.en.cancelled);
 });
 
 // ============ PAYMENT ============
@@ -492,7 +555,7 @@ function generateBookingId() {
 
 bot.action('confirm_booking', async (ctx) => {
   const session = getSession(ctx);
-  ctx.answerCbQuery();
+  await ctx.answerCbQuery();
 
   const bookingId = generateBookingId();
   session.bookingId = bookingId;
@@ -515,68 +578,77 @@ bot.action('confirm_booking', async (ctx) => {
     total: session.prices.totalPrice,
     deposit: session.prices.depositPrice,
     remaining: session.prices.remainingPrice,
-    paymentStatus: 'COMPLETED', // set only once actually confirmed — see IPN handler
+    paymentStatus: 'COMPLETED',
     payerEmail: session.email
   };
 
-  await ctx.reply(t(session, 'creating_invoice'));
+  const baseText = summaryText(session);
 
-  const buttons = [];
-
-  try {
-    const invoice = await createInvoice({
-      bookingId,
-      depositAmount: session.prices.depositPrice,
-      description: `SkiSchool.ge booking ${bookingId}`,
-      ipnCallbackUrl: `${PUBLIC_URL}/ipn/nowpayments`,
-      successUrl: `https://t.me/${ctx.botInfo.username}`,
-      cancelUrl: `https://t.me/${ctx.botInfo.username}`
-    });
-    buttons.push([Markup.button.url(t(session, 'btn_pay'), invoice.invoice_url)]);
-  } catch (error) {
-    console.error('❌ NOWPayments invoice creation failed:', error);
+  async function updateSummaryMessage(extraText, keyboard) {
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        session.summaryMessageId,
+        undefined,
+        `${baseText}\n\n${extraText}`,
+        keyboard
+      );
+    } catch (e) {
+      const msg = await ctx.reply(extraText, keyboard);
+      session.summaryMessageId = msg.message_id;
+    }
   }
 
+  await updateSummaryMessage(t(session, 'creating_invoice'));
+
   try {
-    const cbInvoice = await cryptobot.createInvoice({
+    const invoice = await cryptobot.createInvoice({
       bookingId,
       amount: session.prices.depositPrice,
       description: `SkiSchool.ge booking ${bookingId}`
     });
-    buttons.push([Markup.button.url(t(session, 'btn_pay_cryptobot'), cbInvoice.bot_invoice_url)]);
+
+    pendingBookings.set(bookingId, {
+      chatId: ctx.chat.id,
+      summaryMessageId: session.summaryMessageId,
+      order,
+      createdAt: Date.now()
+    });
+
+    await updateSummaryMessage(
+      t(session, 'invoice_ready', session.prices.depositPrice),
+      Markup.inlineKeyboard([
+        [Markup.button.url(t(session, 'btn_pay_cryptobot'), invoice.bot_invoice_url)],
+        [Markup.button.callback(t(session, 'btn_check_status'), `check_${bookingId}`)]
+      ])
+    );
   } catch (error) {
     console.error('❌ CryptoBot invoice creation failed:', error);
-  }
-
-  if (buttons.length === 0) {
-    await ctx.reply(t(session, 'invoice_error'));
     session.step = 'confirm';
-    return;
+    await updateSummaryMessage(
+      t(session, 'invoice_error'),
+      Markup.inlineKeyboard([
+        [Markup.button.callback(t(session, 'btn_confirm'), 'confirm_booking')],
+        [Markup.button.callback(t(session, 'btn_cancel'), 'cancel_booking')]
+      ])
+    );
   }
-
-  pendingBookings.set(bookingId, { chatId: ctx.chat.id, order, createdAt: Date.now() });
-
-  buttons.push([Markup.button.callback(t(session, 'btn_check_status'), `check_${bookingId}`)]);
-  await ctx.reply(t(session, 'invoice_ready', session.prices.depositPrice), Markup.inlineKeyboard(buttons));
 });
 
 bot.action(/check_(.+)/, async (ctx) => {
   const session = getSession(ctx);
   const bookingId = ctx.match[1];
-  ctx.answerCbQuery();
 
   if (!pendingBookings.has(bookingId)) {
-    // Either already finalized (client got the confirmation message already)
-    // or expired — either way, nothing pending to report here.
-    return;
+    return ctx.answerCbQuery();
   }
-  await ctx.reply(t(session, 'payment_pending'));
+  await ctx.answerCbQuery(t(session, 'payment_pending'), { show_alert: false });
 });
 
-// ============ NOWPAYMENTS IPN ============
+// ============ CRYPTOBOT WEBHOOK ============
 async function finalizeConfirmedPayment(bookingId, paymentId, paymentProvider) {
   const pending = pendingBookings.get(bookingId);
-  if (!pending) return; // already finalized, or unknown booking — nothing to do
+  if (!pending) return;
 
   pending.order.paymentId = String(paymentId);
   pending.order.paymentProvider = paymentProvider;
@@ -591,56 +663,30 @@ async function finalizeConfirmedPayment(bookingId, paymentId, paymentProvider) {
       body: JSON.stringify(pending.order)
     });
 
-    // We only have chatId, not the Telegram user id the session Map is
-    // keyed by — but chat.id === from.id for private chats, which is all
-    // this bot supports, so this lookup is safe here.
     const session = sessions.get(pending.chatId);
+    const confirmText = (session ? t(session, 'payment_confirmed') : I18N.ru.payment_confirmed) +
+      bookingId +
+      (session ? t(session, 'payment_confirmed_followup') : I18N.ru.payment_confirmed_followup);
+    const errorText = session ? t(session, 'booking_finalize_error') : I18N.ru.booking_finalize_error;
 
-    if (resp.ok) {
-      const text = (session ? t(session, 'payment_confirmed') : I18N.ru.payment_confirmed) +
-        bookingId +
-        (session ? t(session, 'payment_confirmed_followup') : I18N.ru.payment_confirmed_followup);
-      await bot.telegram.sendMessage(pending.chatId, text);
-      pendingBookings.delete(bookingId);
-      sessions.delete(pending.chatId);
-    } else {
+    const finalText = resp.ok ? confirmText : errorText;
+    if (!resp.ok) {
       console.error(`❌ Admin bot rejected crypto booking ${bookingId}:`, resp.status, await resp.text());
-      await bot.telegram.sendMessage(pending.chatId, session ? t(session, 'booking_finalize_error') : I18N.ru.booking_finalize_error);
     }
+
+    try {
+      await bot.telegram.editMessageText(pending.chatId, pending.summaryMessageId, undefined, finalText);
+    } catch (e) {
+      await bot.telegram.sendMessage(pending.chatId, finalText);
+    }
+
+    pendingBookings.delete(bookingId);
+    sessions.delete(pending.chatId);
   } catch (error) {
     console.error('❌ Error forwarding confirmed crypto booking to admin bot:', error);
   }
 }
 
-app.post('/ipn/nowpayments', async (req, res) => {
-  const signature = req.get('x-nowpayments-sig');
-  const { verified, skipped } = verifyIpnSignature(req.rawBody, signature);
-
-  if (!skipped && !verified) {
-    console.warn('⚠️ Rejected IPN with invalid signature');
-    return res.status(401).json({ error: 'Invalid signature' });
-  }
-  if (skipped) {
-    console.warn('⚠️ Processing IPN WITHOUT signature verification (NOWPAYMENTS_IPN_SECRET not set) — INSECURE.');
-  }
-
-  const payload = req.body;
-  const bookingId = payload.order_id;
-
-  console.log(`📩 NOWPayments IPN for ${bookingId}: status=${payload.payment_status}`);
-
-  const isFinal = payload.payment_status === 'finished' || payload.payment_status === 'confirmed';
-  if (!isFinal) {
-    // Still waiting/confirming — nothing to do yet, NOWPayments will call again.
-    return res.json({ ok: true });
-  }
-
-  await finalizeConfirmedPayment(bookingId, payload.payment_id, 'nowpayments');
-  res.json({ ok: true });
-});
-
-// CryptoBot's Crypto Pay API webhook — same finalize path as NOWPayments,
-// just a different provider and a different signature scheme (see cryptobot.js).
 app.post('/webhook/cryptobot', async (req, res) => {
   const signature = req.get('crypto-pay-api-signature');
   const { verified, skipped } = cryptobot.verifyWebhookSignature(req.body, signature);
@@ -659,7 +705,7 @@ app.post('/webhook/cryptobot', async (req, res) => {
   }
 
   const invoice = update.payload || {};
-  const bookingId = invoice.payload; // our bookingId, round-tripped via the invoice's custom `payload` field
+  const bookingId = invoice.payload;
 
   console.log(`📩 CryptoBot webhook for ${bookingId}: status=${invoice.status}`);
 
@@ -671,9 +717,6 @@ app.post('/webhook/cryptobot', async (req, res) => {
   res.json({ ok: true });
 });
 
-// Clean up pending bookings that never got paid, so the Map doesn't grow
-// forever (NOWPayments invoices expire on their side after ~20-60 minutes
-// depending on plan; give it a couple hours of buffer here).
 setInterval(() => {
   const cutoff = Date.now() - 2 * 60 * 60 * 1000;
   for (const [bookingId, pending] of pendingBookings.entries()) {
